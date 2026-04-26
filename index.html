@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGL2 SPH Fluid Benchmark</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: #eee; font-family: sans-serif; }
+        #ui { position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 8px; }
+        button { padding: 10px 15px; margin-right: 10px; cursor: pointer; background: #333; color: white; border: 1px solid #555; border-radius: 4px;}
+        button:hover { background: #444; }
+        #stats { margin-top: 15px; font-family: monospace; white-space: pre; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+<div id="ui">
+        <label for="steps-input" style="margin-right: 5px; font-size: 14px;">Steps/Frame:</label>
+    <input type="number" id="steps-input" value="5" min="1" max="50" style="margin-right: 15px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; padding: 8px 5px; width: 50px;">
+    <button id="btn-low">Low Mode (16k)</button>
+   <button id="btn-high">High Mode (65k)</button>
+        <button id="btn-low-small">Low Reduced Size (16k, 16^3)</button>
+        <button id="btn-render">Start Render Mode</button>
+        <button id="btn-headless">Start Headless Benchmark</button>
+        <div id="stats">Awaiting start...</div>
+    </div>
+    <canvas id="glcanvas"></canvas>
+
+    <script>
+        // --- 1. Initialization ---
+        const canvas = document.getElementById('glcanvas');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        const gl = canvas.getContext('webgl2');
+const statsDiv = document.getElementById('stats');
+if (!gl) {
+    alert('WebGL2 is not supported by your browser.');
+            throw new Error('WebGL2 required');
+        }
+
+        // EXT_color_buffer_float is CRITICAL. Without it, we cannot render to RGBA32F textures.
+        const extColorBufferFloat = gl.getExtension('EXT_color_buffer_float');
+        if (!extColorBufferFloat) {
+            alert('EXT_color_buffer_float is not supported. Benchmark cannot run.');
+            throw new Error('EXT_color_buffer_float required');
+        }
+
+        // --- 2. Full-Screen Quad Setup ---
+        // We need this geometry to run our Fragment Shaders (GPGPU compute passes)
+        const quadVertices = new Float32Array([
+            -1.0, -1.0,
+             1.0, -1.0,
+            -1.0,  1.0,
+            -1.0,  1.0,
+             1.0, -1.0,
+             1.0,  1.0
+        ]);
+
+        const quadVAO = gl.createVertexArray();
+        const quadVBO = gl.createBuffer();
+
+        gl.bindVertexArray(quadVAO);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
+
+        // Position attribute (location 0)
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+        gl.bindVertexArray(null);
+
+// --- 3. Global Constants ---
+// We defer WebGL initialization until a start button is pressed.
+let isPipelineBuilt = false;
+let simMode = 'low'; // Default to standard low mode
+
+function buildPipelineAndStart(isRenderMode) {
+    if (isPipelineBuilt) return; // Prevent building twice
+    isPipelineBuilt = true;
+
+const IS_HIGH_MODE = simMode === 'high';
+ const IS_SMALL_WORLD = simMode === 'low_small';
+ const TEXT_WIDTH = IS_HIGH_MODE ? 256 : 128;
+ const TEXT_HEIGHT = IS_HIGH_MODE ? 256 : 128;
+ const PARTICLE_COUNT = TEXT_WIDTH * TEXT_HEIGHT;
+
+ // Dynamic World and Grid Variables
+ const WORLD_SIZE = IS_SMALL_WORLD ? 16 : 32;
+ const WORLD_MAX = WORLD_SIZE - 1; // 15 or 31
+ const WORLD_BOUND = WORLD_SIZE - 0.01; // 15.99 or 31.99
+
+ // 32^3 = 32768 cells (needs 256x128 texture). 16^3 = 4096 cells (needs 64x64 texture).
+ const GRID_WIDTH = IS_SMALL_WORLD ? 64 : 256;
+ const GRID_HEIGHT = IS_SMALL_WORLD ? 64 : 128;
+
+ // We convert these to strings so we can inject them into the GLSL shaders dynamically
+ const STR_TEXT_WIDTH = TEXT_WIDTH.toString();
+ const STR_TOTAL_PARTICLES = PARTICLE_COUNT.toString();
+ const STR_SCAN_STEPS = (Math.log2(PARTICLE_COUNT) + 1).toString();
+
+ // Shader Injection Strings for World Scale
+ const STR_WORLD_SIZE = WORLD_SIZE.toFixed(1);
+ const STR_WORLD_MAX = WORLD_MAX.toString();
+ const STR_WORLD_BOUND = WORLD_BOUND.toFixed(2);
+ const STR_GRID_WIDTH = GRID_WIDTH.toString();
+ const STR_Z_MULT = (WORLD_SIZE * WORLD_SIZE).toString(); // 1024 or 256
+ const STR_HALF_WORLD = (WORLD_SIZE / 2.0).toFixed(1);
+// --- 3.5. GPGPU Data Structures (Ping-Pong) ---
+ // Helper to create RGBA32F textures for data storage
+ function createDataTexture(gl, width, height, data) {
+     const tex = gl.createTexture();
+     gl.bindTexture(gl.TEXTURE_2D, tex);
+     // Nearest filtering is required for reading exact float data values
+     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, data);
+     return tex;
+ }
+
+ // Helper to bind a texture to a Framebuffer Object (FBO)
+ function createFBO(gl, texture) {
+     const fbo = gl.createFramebuffer();
+     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+     return fbo;
+ }
+
+ // Initialize random particle positions and zero velocities
+ const initialPositions = new Float32Array(PARTICLE_COUNT * 4);
+ const initialVelocities = new Float32Array(PARTICLE_COUNT * 4);
+ for (let i = 0; i < PARTICLE_COUNT; i++) {
+  // "Dam Break" scenario: Start particles clustered in the left half of the dynamic grid
+  initialPositions[i * 4 + 0] = Math.random() * (WORLD_SIZE / 2.0); // x limited to half volume
+  initialPositions[i * 4 + 1] = Math.random() * WORLD_SIZE; // y
+  initialPositions[i * 4 + 2] = Math.random() * WORLD_SIZE; // z
+  initialPositions[i * 4 + 3] = i; // Store original index in w
+  // Velocities remain 0.0 initially
+ }
+
+ // Ping-pong buffers for position
+ const posTexA = createDataTexture(gl, TEXT_WIDTH, TEXT_HEIGHT, initialPositions);
+ const posTexB = createDataTexture(gl, TEXT_WIDTH, TEXT_HEIGHT, null);
+ const posFboA = createFBO(gl, posTexA);
+ const posFboB = createFBO(gl, posTexB);
+
+ // Ping-pong buffers for velocity
+ const velTexA = createDataTexture(gl, TEXT_WIDTH, TEXT_HEIGHT, initialVelocities);
+ const velTexB = createDataTexture(gl, TEXT_WIDTH, TEXT_HEIGHT, null);
+ const velFboA = createFBO(gl, velTexA);
+ const velFboB = createFBO(gl, velTexB);
+
+ // State tracking for the current read/write cycle
+ let readState = { posTex: posTexA, velTex: velTexA };
+ let writeState = { posFbo: posFboB, velFbo: velFboB, posTex: posTexB, velTex: velTexB };
+
+ // Swap function to be called at the end of every simulation step
+ function swapPingPong() {
+     const tempRead = readState;
+     readState = { posTex: writeState.posTex, velTex: writeState.velTex };
+     writeState = { 
+         posFbo: tempRead.posTex === posTexA ? posFboA : posFboB, 
+         velFbo: tempRead.velTex === velTexA ? velFboA : velFboB,
+         posTex: tempRead.posTex, 
+         velTex: tempRead.velTex 
+     };
+ }
+
+// --- 3.6. Sort and Grid Data Structures ---
+  // The bitonic sort requires its own ping-pong buffers.
+  // Each pixel stores: (cellIndex, particleOriginalIndex, 0, 0)
+  const initialSortData = new Float32Array(PARTICLE_COUNT * 4);
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+      // We initialize the Y component with the particle's original ID.
+      // The X component (cell index) will be calculated and written by the first compute pass.
+      initialSortData[i * 4 + 1] = i; 
+  }
+
+  const sortTexA = createDataTexture(gl, TEXT_WIDTH, TEXT_HEIGHT, initialSortData);
+  const sortTexB = createDataTexture(gl, TEXT_WIDTH, TEXT_HEIGHT, null);
+  const sortFboA = createFBO(gl, sortTexA);
+  const sortFboB = createFBO(gl, sortTexB);
+
+ // The grid lookup texture stores the (startIndex, count) for each 3D cell.
+ // Dimensions dynamically set above based on WORLD_SIZE
+ const gridTex = createDataTexture(gl, GRID_WIDTH, GRID_HEIGHT, null);
+  const gridFbo = createFBO(gl, gridTex);
+  
+// --- 3.7. Shader Compilation Boilerplate ---
+  
+  // Helper function to compile a shader from source
+  function compileShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          console.error('Shader compilation failed:', gl.getShaderInfoLog(shader));
+          gl.deleteShader(shader);
+          return null;
+      }
+      return shader;
+  }
+
+  // Helper function to link vertex and fragment shaders into a program
+  function createProgram(gl, vsSource, fsSource) {
+      const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+      const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+      const program = gl.createProgram();
+      gl.attachShader(program, vertexShader);
+      gl.attachShader(program, fragmentShader);
+      gl.linkProgram(program);
+
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          console.error('Program linking failed:', gl.getProgramInfoLog(program));
+          return null;
+      }
+      return program;
+  }
+
+  // Shared Full-Screen Quad Vertex Shader for all GPGPU passes
+  // Since we are just processing textures, the vertex shader is always the same:
+  // it just draws a flat square over the whole screen/framebuffer.
+  const quadVertexShaderSource = `#version 300 es
+  layout(location = 0) in vec2 a_position;
+  out vec2 v_texCoord;
+  void main() {
+      // Convert from clip space (-1 to 1) to texture coordinates (0 to 1)
+      v_texCoord = a_position * 0.5 + 0.5;
+      gl_Position = vec4(a_position, 0.0, 1.0);
+  }
+  `;
+
+
+// --- 3.8. Shader Programs ---
+
+  // 1. Spatial Hashing Pass
+  // Reads particle positions, calculates which 3D grid cell they belong to, 
+  // and outputs (cellIndex, particleId) into the sort buffer.
+  const hashFsSource = `#version 300 es
+  precision highp float;
+
+  in vec2 v_texCoord;
+  out vec4 outColor;
+
+  uniform sampler2D u_posTex;
+
+  void main() {
+      // Read position (xyz) and original particle ID (w)
+      vec4 posData = texture(u_posTex, v_texCoord);
+      vec3 pos = posData.xyz;
+      float particleId = posData.w;
+
+// DEFENSIVE DEBUGGING: Clamp positions so they never exceed the dynamic bounds.
+   // If a particle shoots off to infinity, it gets pinned to the max cell
+   // preventing catastrophic out-of-bounds memory lookups later.
+   vec3 clampedPos = clamp(pos, vec3(0.0), vec3(${STR_WORLD_BOUND}));
+   
+   // Calculate the 3D cell coordinates
+   vec3 cell3D = floor(clampedPos);
+   
+   // Flatten the 3D coordinate into a 1D cell index
+   float cellIndex = cell3D.x + (cell3D.y * ${STR_WORLD_SIZE}) + (cell3D.z * float(${STR_Z_MULT}));
+
+      // R = Cell Index (The key we will use for the bitonic sort)
+      // G = Particle ID (The payload that follows the key)
+      // B, A = Unused
+      outColor = vec4(cellIndex, particleId, 0.0, 0.0);
+  }
+  `;
+
+  const hashProgram = createProgram(gl, quadVertexShaderSource, hashFsSource);
+  const hashPosUniformLoc = gl.getUniformLocation(hashProgram, "u_posTex");
+
+
+// 2. Bitonic Sort Pass
+  // This shader will be run 153 times per frame.
+  // We use gl_FragCoord to find our exact 1D index, find our partner, and compare.
+  const sortFsSource = `#version 300 es
+  precision highp float;
+  // We explicitly need highp int for bitwise math on indices up to 65536
+  precision highp int;
+
+  in vec2 v_texCoord;
+  out vec4 outColor;
+
+  uniform sampler2D u_sortTex;
+  uniform int u_k; // Outer loop parameter (stage size)
+  uniform int u_j; // Inner loop parameter (comparison step size)
+const int TEXT_WIDTH = ${STR_TEXT_WIDTH};
+void main() {
+      // Find our exact integer 2D pixel coordinate
+      ivec2 pixelCoord = ivec2(gl_FragCoord.xy);
+      
+      // Flatten into a 1D index
+      int id = pixelCoord.y * TEXT_WIDTH + pixelCoord.x;
+
+      // Bitonic Sort Magic: XORing the ID with the step size gives us our comparison partner
+      int partnerId = id ^ u_j;
+
+      // Convert partner 1D index back to 2D coordinate
+      ivec2 partnerCoord = ivec2(partnerId % TEXT_WIDTH, partnerId / TEXT_WIDTH);
+
+      // texelFetch grabs the exact texel. The '0' is the mipmap level.
+      vec4 myData = texelFetch(u_sortTex, pixelCoord, 0);
+      vec4 partnerData = texelFetch(u_sortTex, partnerCoord, 0);
+
+      // We are sorting by the spatial grid cell index (which is stored in X)
+      float myKey = myData.x;
+      float partnerKey = partnerData.x;
+
+      // Determine if we are sorting ascending or descending for this specific block
+      bool ascending = (id & u_k) == 0;
+      
+      vec4 result = myData;
+
+      // If we are the "left" element in the pair
+      if (partnerId > id) {
+          if (ascending ? (myKey > partnerKey) : (myKey < partnerKey)) {
+              result = partnerData; // Swap!
+          }
+      } 
+      // If we are the "right" element in the pair
+      else {
+          if (ascending ? (myKey < partnerKey) : (myKey > partnerKey)) {
+              result = partnerData; // Swap!
+          }
+      }
+
+      outColor = result;
+  }
+  `;
+
+  const sortProgram = createProgram(gl, quadVertexShaderSource, sortFsSource);
+  const sortTexUniformLoc = gl.getUniformLocation(sortProgram, "u_sortTex");
+  const sortKUniformLoc = gl.getUniformLocation(sortProgram, "u_k");
+  const sortJUniformLoc = gl.getUniformLocation(sortProgram, "u_j");
+
+
+
+// --- 3.9. Grid Scanner Pass (Binary Search) ---
+// One thread per 3D Grid Cell.
+// It searches the sorted particle array to find its start index and count.
+const scanFsSource = `#version 300 es
+precision highp float;
+precision highp int;
+in vec2 v_texCoord;
+out vec4 outColor;
+uniform sampler2D u_sortTex;
+const int TEXT_WIDTH = ${STR_TEXT_WIDTH};
+const int TOTAL_PARTICLES = ${STR_TOTAL_PARTICLES};
+
+// Helper function to read the cell index of a sorted particle at a specific 1D index
+int getCellAt(int index) {
+    ivec2 uv = ivec2(index % TEXT_WIDTH, index / TEXT_WIDTH);
+    return int(texelFetch(u_sortTex, uv, 0).x);
+}
+
+void main() {
+    // Find our exact integer 2D pixel coordinate in the Grid Texture
+    ivec2 pixelCoord = ivec2(gl_FragCoord.xy);
+    
+// Calculate which 3D cell ID this thread is responsible for
+    int targetCell = pixelCoord.y * ${STR_GRID_WIDTH} + pixelCoord.x;
+    
+    // 1. Binary Search for the FIRST occurrence of targetCell
+    int low = 0;
+    int high = TOTAL_PARTICLES - 1;
+    int firstIndex = -1;
+    
+    for (int i = 0; i < ${STR_SCAN_STEPS}; i++) {
+        if (low > high) break;
+        int mid = (low + high) / 2;
+        int midCell = getCellAt(mid);
+        if (midCell == targetCell) {
+            firstIndex = mid;
+            high = mid - 1; // Keep looking left for earlier occurrences
+        } else if (midCell < targetCell) {
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    
+    float count = 0.0;
+    float startIdx = -1.0;
+    
+    // 2. If we found the cell, we now need to find the LAST occurrence to get the count
+    if (firstIndex != -1) {
+        startIdx = float(firstIndex);
+        low = firstIndex;
+        high = TOTAL_PARTICLES - 1;
+        int lastIndex = firstIndex;
+        
+        for (int i = 0; i < ${STR_SCAN_STEPS}; i++) {
+            if (low > high) break;
+            int mid = (low + high) / 2;
+            int midCell = getCellAt(mid);
+            if (midCell == targetCell) {
+                lastIndex = mid;
+                low = mid + 1;  // Keep looking right for later occurrences
+            } else if (midCell < targetCell) {
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        count = float(lastIndex - firstIndex + 1);
+    }
+    
+    // R = Start Index in the sorted array, G = Number of particles in this cell
+    outColor = vec4(startIdx, count, 0.0, 0.0);
+}
+`;
+
+  const scanProgram = createProgram(gl, quadVertexShaderSource, scanFsSource);
+  const scanSortUniformLoc = gl.getUniformLocation(scanProgram, "u_sortTex");
+
+
+// --- 3.95. Density Data Structure ---
+// A dedicated texture for Density (262 KB).
+const densityTex = createDataTexture(gl, TEXT_WIDTH, TEXT_HEIGHT, null);
+const densityFbo = createFBO(gl, densityTex);
+
+// --- 3.10. SPH Physics Passes ---
+
+// 1. Density Shader
+// Reads positions, searches neighbors, and calculates fluid density.
+const densityFsSource = `#version 300 es
+precision highp float;
+precision highp int;
+in vec2 v_texCoord;
+out vec4 outColor;
+
+uniform sampler2D u_posTex;
+uniform sampler2D u_sortTex;
+uniform sampler2D u_gridTex;
+const int TEXT_WIDTH = ${STR_TEXT_WIDTH};
+const float H = 1.0;
+const float MASS = 1.0;
+const float H2 = H * H;
+const float H9 = pow(H, 9.0);
+const float POLY6 = 315.0 / (64.0 * 3.14159265 * H9);
+
+// Helper to flatten 3D cell to 1D index
+   int getCellIndex(ivec3 cell) {
+    cell = clamp(cell, ivec3(0), ivec3(${STR_WORLD_MAX}));
+    return cell.x + (cell.y * (${STR_WORLD_MAX} + 1)) + (cell.z * ${STR_Z_MULT});
+   }
+   void main() {
+    vec3 myPos = texture(u_posTex, v_texCoord).xyz;
+    float myDensity = 0.0;
+    ivec3 myCell = ivec3(floor(myPos));
+
+    // The 27-Cell Neighbor Search
+    for (int z = -1; z <= 1; z++) {
+     for (int y = -1; y <= 1; y++) {
+      for (int x = -1; x <= 1; x++) {
+       ivec3 neighborCell = myCell + ivec3(x, y, z);
+       // Skip if out of grid bounds
+       if (neighborCell.x < 0 || neighborCell.x > ${STR_WORLD_MAX} || neighborCell.y < 0 || neighborCell.y > ${STR_WORLD_MAX} || neighborCell.z < 0 || neighborCell.z > ${STR_WORLD_MAX}) continue;
+
+                int cellIdx = getCellIndex(neighborCell);
+                ivec2 gridUV = ivec2(cellIdx % ${STR_GRID_WIDTH}, cellIdx / ${STR_GRID_WIDTH});
+                vec4 gridData = texelFetch(u_gridTex, gridUV, 0);
+
+                int startIdx = int(gridData.x);
+                int count = int(gridData.y);
+
+                if (count > 0) {
+                    for (int i = 0; i < count; i++) {
+                        int sortedIdx = startIdx + i;
+                        ivec2 sortUV = ivec2(sortedIdx % TEXT_WIDTH, sortedIdx / TEXT_WIDTH);
+                        int originalId = int(texelFetch(u_sortTex, sortUV, 0).y);
+
+                        ivec2 neighborUV = ivec2(originalId % TEXT_WIDTH, originalId / TEXT_WIDTH);
+                        vec3 neighborPos = texelFetch(u_posTex, neighborUV, 0).xyz;
+
+                        vec3 diff = myPos - neighborPos;
+                        float r2 = dot(diff, diff);
+
+                        // If within smoothing radius, accumulate density
+                        if (r2 < H2) {
+                            float w = H2 - r2;
+                            myDensity += MASS * POLY6 * w * w * w;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Prevent division by zero in the force pass
+    myDensity = max(myDensity, 0.0001);
+    outColor = vec4(myDensity, 0.0, 0.0, 0.0);
+}`;
+const densityProgram = createProgram(gl, quadVertexShaderSource, densityFsSource);
+const denPosUniformLoc = gl.getUniformLocation(densityProgram, "u_posTex");
+const denSortUniformLoc = gl.getUniformLocation(densityProgram, "u_sortTex");
+const denGridUniformLoc = gl.getUniformLocation(densityProgram, "u_gridTex");
+
+// 2. Force Shader
+// Reads positions, velocities, and density to calculate new velocities.
+const forceFsSource = `#version 300 es
+precision highp float;
+precision highp int;
+in vec2 v_texCoord;
+out vec4 outColor;
+
+uniform sampler2D u_posTex;
+uniform sampler2D u_velTex;
+uniform sampler2D u_densityTex;
+uniform sampler2D u_sortTex;
+uniform sampler2D u_gridTex;
+
+const int TEXT_WIDTH = ${STR_TEXT_WIDTH};
+const float H = 1.0;
+const float MASS = 1.0;
+const float REST_DENSITY = 5.0; // Tuned for stability
+const float STIFFNESS = 150.0;
+const float VISCOSITY = 1.5;
+const float DT = 0.005;
+
+const float SPIKY_GRAD = -45.0 / (3.14159265 * pow(H, 6.0));
+const float VISC_LAP = 45.0 / (3.14159265 * pow(H, 6.0));
+
+int getCellIndex(ivec3 cell) {
+    cell = clamp(cell, ivec3(0), ivec3(${STR_WORLD_MAX}));
+    return cell.x + (cell.y * (${STR_WORLD_MAX} + 1)) + (cell.z * ${STR_Z_MULT});
+   }
+   void main() {
+    ivec2 myUV = ivec2(gl_FragCoord.xy);
+    int myId = myUV.y * TEXT_WIDTH + myUV.x;
+    vec3 myPos = texture(u_posTex, v_texCoord).xyz;
+    vec3 myVel = texture(u_velTex, v_texCoord).xyz;
+    float myDensity = texture(u_densityTex, v_texCoord).x;
+
+    // Calculate local pressure
+    float myPressure = STIFFNESS * (myDensity - REST_DENSITY);
+    vec3 forcePressure = vec3(0.0);
+    vec3 forceViscosity = vec3(0.0);
+    vec3 gravity = vec3(0.0, -9.8, 0.0);
+
+    ivec3 myCell = ivec3(floor(myPos));
+
+    // The 27-Cell Neighbor Search (Cache breaker!)
+    for (int z = -1; z <= 1; z++) {
+     for (int y = -1; y <= 1; y++) {
+      for (int x = -1; x <= 1; x++) {
+       ivec3 neighborCell = myCell + ivec3(x, y, z);
+       if (neighborCell.x < 0 || neighborCell.x > ${STR_WORLD_MAX} || neighborCell.y < 0 || neighborCell.y > ${STR_WORLD_MAX} || neighborCell.z < 0 || neighborCell.z > ${STR_WORLD_MAX}) continue;
+
+                int cellIdx = getCellIndex(neighborCell);
+                ivec2 gridUV = ivec2(cellIdx % ${STR_GRID_WIDTH}, cellIdx / ${STR_GRID_WIDTH});
+                vec4 gridData = texelFetch(u_gridTex, gridUV, 0);
+
+                int startIdx = int(gridData.x);
+                int count = int(gridData.y);
+
+                if (count > 0) {
+                    for (int i = 0; i < count; i++) {
+                        int sortedIdx = startIdx + i;
+                        ivec2 sortUV = ivec2(sortedIdx % TEXT_WIDTH, sortedIdx / TEXT_WIDTH);
+                        int originalId = int(texelFetch(u_sortTex, sortUV, 0).y);
+
+                        if (originalId == myId) continue; // Don't interact with self
+
+                        ivec2 neighborUV = ivec2(originalId % TEXT_WIDTH, originalId / TEXT_WIDTH);
+                        vec3 neighborPos = texelFetch(u_posTex, neighborUV, 0).xyz;
+                        vec3 neighborVel = texelFetch(u_velTex, neighborUV, 0).xyz;
+                        float neighborDensity = texelFetch(u_densityTex, neighborUV, 0).x;
+
+                        vec3 diff = myPos - neighborPos;
+                        float r = length(diff);
+
+                        if (r > 0.0 && r < H) {
+                            vec3 dir = diff / r;
+                            float neighborPressure = STIFFNESS * (neighborDensity - REST_DENSITY);
+                            
+                            // Pressure Force (Repulsion)
+                            float pTerm = (myPressure + neighborPressure) / (2.0 * neighborDensity);
+                            forcePressure += -dir * MASS * pTerm * SPIKY_GRAD * pow(H - r, 2.0);
+
+                            // Viscosity Force (Friction)
+                            vec3 vDiff = neighborVel - myVel;
+                            forceViscosity += VISCOSITY * MASS * (vDiff / neighborDensity) * VISC_LAP * (H - r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    vec3 totalForce = forcePressure + forceViscosity + gravity;
+    vec3 newVel = myVel + (totalForce / myDensity) * DT;
+
+// Wall Bouncing Logic
+    vec3 nextPos = myPos + newVel * DT;
+    float damping = 0.5; // Energy lost hitting a wall
+    if (nextPos.x < 0.0 || nextPos.x > ${STR_WORLD_BOUND}) newVel.x *= -damping;
+    if (nextPos.y < 0.0 || nextPos.y > ${STR_WORLD_BOUND}) newVel.y *= -damping;
+    if (nextPos.z < 0.0 || nextPos.z > ${STR_WORLD_BOUND}) newVel.z *= -damping;
+
+    outColor = vec4(newVel, 0.0);
+}`;
+const forceProgram = createProgram(gl, quadVertexShaderSource, forceFsSource);
+const forcePosUniformLoc = gl.getUniformLocation(forceProgram, "u_posTex");
+const forceVelUniformLoc = gl.getUniformLocation(forceProgram, "u_velTex");
+const forceDenUniformLoc = gl.getUniformLocation(forceProgram, "u_densityTex");
+const forceSortUniformLoc = gl.getUniformLocation(forceProgram, "u_sortTex");
+const forceGridUniformLoc = gl.getUniformLocation(forceProgram, "u_gridTex");
+
+// 3. Integration Shader
+// Very cheap final pass: Adds velocity to position.
+const integrateFsSource = `#version 300 es
+precision highp float;
+in vec2 v_texCoord;
+out vec4 outColor;
+
+uniform sampler2D u_posTex;
+uniform sampler2D u_velTex; // This will read the newly calculated velocity
+const float DT = 0.005;
+
+void main() {
+    vec4 posData = texture(u_posTex, v_texCoord);
+    vec3 myPos = posData.xyz;
+    float particleId = posData.w; // Preserve original ID!
+    vec3 myVel = texture(u_velTex, v_texCoord).xyz;
+
+    // Euler integration
+    vec3 newPos = myPos + myVel * DT;
+
+// Hard clamp to prevent memory escape crashes if a particle somehow clips a wall
+    newPos = clamp(newPos, vec3(0.01), vec3(${STR_WORLD_BOUND}));
+
+    outColor = vec4(newPos, particleId);
+}`;
+const intProgram = createProgram(gl, quadVertexShaderSource, integrateFsSource);
+const intPosUniformLoc = gl.getUniformLocation(intProgram, "u_posTex");
+const intVelUniformLoc = gl.getUniformLocation(intProgram, "u_velTex");
+
+// --- 3.11. Render Pass ---
+// Reads the position texture and draws a point for each particle.
+const renderVsSource = `#version 300 es
+precision highp float;
+uniform sampler2D u_posTex;
+uniform float u_aspect;
+const int TEXT_WIDTH = ${STR_TEXT_WIDTH};
+
+// Pass the depth to the fragment shader for 3D shading
+out float v_depth; 
+
+void main() {
+    int x = gl_VertexID % TEXT_WIDTH;
+    int y = gl_VertexID / TEXT_WIDTH;
+    vec3 pos = texelFetch(u_posTex, ivec2(x, y), 0).xyz;
+
+    // 1. Center the dynamic grid at the origin
+    vec3 centeredPos = pos - vec3(${STR_HALF_WORLD}, ${STR_HALF_WORLD}, ${STR_HALF_WORLD});
+
+    // 2. Rotate to get a nice isometric 3D angle
+    // Y-axis rotation (spin around) ~ -45 degrees
+    float ry = -0.785; 
+    mat3 rotY = mat3(
+        cos(ry), 0.0, sin(ry),
+        0.0, 1.0, 0.0,
+        -sin(ry), 0.0, cos(ry)
+    );
+
+    // X-axis rotation (tilt down) ~ -30 degrees
+    float rx = -0.523; 
+    mat3 rotX = mat3(
+        1.0, 0.0, 0.0,
+        0.0, cos(rx), -sin(rx),
+        0.0, sin(rx), cos(rx)
+    );
+
+    vec3 camPos = rotX * rotY * centeredPos;
+
+    // 3. Push back away from the camera to view the whole volume
+    camPos.z -= 60.0;
+    
+    // Send depth to fragment shader
+    v_depth = camPos.z;
+
+    // 4. Manual Perspective Projection
+    float fov = 1.0; 
+    vec4 projected = vec4(camPos.x * fov, camPos.y * fov, camPos.z, -camPos.z);
+    
+    // Correct for mobile screen aspect ratio so it doesn't stretch
+    projected.x /= u_aspect;
+
+    gl_Position = projected;
+
+    // 5. Dynamic Point Size (Closer = larger, Further = smaller)
+    gl_PointSize = max(1.0, 200.0 / -camPos.z);
+}`;
+
+const renderFsSource = `#version 300 es
+precision mediump float;
+in float v_depth;
+out vec4 outColor;
+void main() {
+    // Darken particles that are further away in the Z-axis
+    // (-60 is middle, -80 is back wall, -40 is front wall)
+    float depthFactor = clamp((v_depth + 90.0) / 60.0, 0.2, 1.0);
+    
+    // Bright blue, scaled by depth
+    outColor = vec4(0.2 * depthFactor, 0.6 * depthFactor, 1.0 * depthFactor, 1.0);
+}`;
+
+const renderProgram = createProgram(gl, renderVsSource, renderFsSource);
+const renderPosUniformLoc = gl.getUniformLocation(renderProgram, "u_posTex");
+const renderAspectUniformLoc = gl.getUniformLocation(renderProgram, "u_aspect");
+
+
+// --- 3.12. The Core Simulation Step ---
+// This JavaScript function acts only as the "Dispatcher".
+// It queues up all the GPU commands but NEVER reads data back to the CPU.
+function stepSimulation() {
+    // Bind the full-screen quad geometry we set up earlier
+    gl.bindVertexArray(quadVAO);
+
+    // ==========================================
+    // PASS 1: Spatial Hashing
+    // Output: sortFboA
+    // Input: readState.posTex
+    // ==========================================
+    gl.bindFramebuffer(gl.FRAMEBUFFER, sortFboA);
+    gl.viewport(0, 0, TEXT_WIDTH, TEXT_HEIGHT);
+    gl.useProgram(hashProgram);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, readState.posTex);
+    gl.uniform1i(hashPosUniformLoc, 0);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // ==========================================)
+    // Ping-pongs between sortFboA and sortFboB
+    // ==========================================
+    gl.useProgram(sortProgram);
+    let currentSortReadTex = sortTexA;
+    let currentSortWriteFbo = sortFboB;
+
+for (let k = 2; k <= PARTICLE_COUNT; k <<= 1) {
+        for (let j = k >> 1; j > 0; j >>= 1) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, currentSortWriteFbo);
+
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, currentSortReadTex);
+            gl.uniform1i(sortTexUniformLoc, 0);
+
+            gl.uniform1i(sortKUniformLoc, k);
+            gl.uniform1i(sortJUniformLoc, j);
+
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            // Swap sort ping-pong state
+            if (currentSortReadTex === sortTexA) {
+                currentSortReadTex = sortTexB;
+                currentSortWriteFbo = sortFboA;
+            } else {
+                currentSortReadTex = sortTexA;
+                currentSortWriteFbo = sortFboB;
+            }
+        }
+    }
+    // At the end of the loop, currentSortReadTex holds the fully sorted array.
+
+    // ==========================================
+    // PASS 3: Grid Scanner
+    // Output: gridFbo
+    // Input: currentSortReadTex
+    // ==========================================
+    gl.bindFramebuffer(gl.FRAMEBUFFER, gridFbo);
+    gl.viewport(0, 0, GRID_WIDTH, GRID_HEIGHT);
+    gl.useProgram(scanProgram);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, currentSortReadTex);
+    gl.uniform1i(scanSortUniformLoc, 0);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // ==========================================
+    // PASS 4: Density Calculation
+    // Output: densityFbo
+    // Inputs: readState.posTex, currentSortReadTex, gridTex
+    // ==========================================
+    gl.bindFramebuffer(gl.FRAMEBUFFER, densityFbo);
+    gl.viewport(0, 0, TEXT_WIDTH, TEXT_HEIGHT);
+    gl.useProgram(densityProgram);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, readState.posTex);
+    gl.uniform1i(denPosUniformLoc, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, currentSortReadTex);
+    gl.uniform1i(denSortUniformLoc, 1);
+
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, gridTex);
+    gl.uniform1i(denGridUniformLoc, 2);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // ==========================================
+    // PASS 5: Force Calculation
+    // Output: writeState.velFbo
+    // Inputs: readState.posTex, readState.velTex, densityTex, currentSortReadTex, gridTex
+    // ==========================================
+    gl.bindFramebuffer(gl.FRAMEBUFFER, writeState.velFbo);
+    gl.useProgram(forceProgram);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, readState.posTex);
+    gl.uniform1i(forcePosUniformLoc, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, readState.velTex);
+    gl.uniform1i(forceVelUniformLoc, 1);
+
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, densityTex);
+    gl.uniform1i(forceDenUniformLoc, 2);
+
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, currentSortReadTex);
+    gl.uniform1i(forceSortUniformLoc, 3);
+
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, gridTex);
+    gl.uniform1i(forceGridUniformLoc, 4);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // ==========================================
+    // PASS 6: Integration (Update Positions)
+    // Output: writeState.posFbo
+    // Inputs: readState.posTex, writeState.velTex (we read the velocities we JUST calculated)
+    // ==========================================
+    gl.bindFramebuffer(gl.FRAMEBUFFER, writeState.posFbo);
+    gl.useProgram(intProgram);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, readState.posTex);
+    gl.uniform1i(intPosUniformLoc, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    // CRITICAL: We use the velocities we just wrote to writeState.velTex
+    gl.bindTexture(gl.TEXTURE_2D, writeState.velTex);
+    gl.uniform1i(intVelUniformLoc, 1);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // ==========================================
+    // PASS 7: Swap Ping-Pong Buffers
+    // ==========================================
+    swapPingPong();
+}
+
+
+// --- 4. Execution Loops & Event Listeners ---
+let isRendering = false;
+let animationFrameId = null;
+
+function renderLoop() {
+    if (!isRendering) return;
+
+// Grab the value from the input box (fallback to 1 if it's empty or invalid)
+    const stepsPerFrame = parseInt(document.getElementById('steps-input').value) || 1;
+
+    // Run the requested number of physics steps before drawing
+    for(let i = 0; i < stepsPerFrame; i++) {
+        stepSimulation();
+    }
+
+    // Bind the default screen framebuffer
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+
+    // Clear the screen (Now including the DEPTH_BUFFER_BIT)
+    gl.clearColor(0.05, 0.05, 0.05, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    // Use our render shader
+    gl.useProgram(renderProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, readState.posTex);
+    gl.uniform1i(renderPosUniformLoc, 0);
+
+    // Pass the aspect ratio to prevent stretching on mobile
+    gl.uniform1f(renderAspectUniformLoc, canvas.width / canvas.height);
+
+    // CRITICAL FIX: Unbind the compute quad VAO!
+    gl.bindVertexArray(null);
+
+    // Turn on Depth Testing so front particles occlude back particles
+    gl.enable(gl.DEPTH_TEST);
+
+    // Fire off the 65,536 vertex IDs to draw the points
+    gl.drawArrays(gl.POINTS, 0, PARTICLE_COUNT);
+
+    // Turn Depth Testing back off so we don't ruin the Compute Passes next frame
+    gl.disable(gl.DEPTH_TEST);
+
+    animationFrameId = requestAnimationFrame(renderLoop);
+}
+
+// Helper to force the GPU to finish execution without reading the whole buffer.
+// We read exactly 1 pixel (4 bytes) to create a synchronization barrier.
+const syncPixel = new Float32Array(4);
+function forceGpuSync() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, writeState.posFbo);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, syncPixel);
+}
+
+// Headless benchmark using the Differential Timing Trick
+// (Time for 60 steps) - (Time for 10 steps) = Pure GPU time for 50 steps
+function runBenchmark() {
+    // Stop rendering if it was running
+    isRendering = false;
+    if (animationFrameId) cancelAnimationFrame(animationFrameId);
+
+    statsDiv.innerText = "Running Benchmark...\nPhase 1: Timing 10 steps...";
+
+    // Use setTimeout so the UI can update the text before locking the thread
+    setTimeout(() => {
+        // --- PHASE 1: Time 10 Steps ---
+        const start10 = performance.now();
+        for (let i = 0; i < 10; i++) {
+            stepSimulation();
+        }
+        forceGpuSync();
+        const end10 = performance.now();
+        const time10 = end10 - start10;
+
+        statsDiv.innerText = "Running Benchmark...\nPhase 2: Timing 60 steps...";
+
+        setTimeout(() => {
+            // --- PHASE 2: Time 60 Steps ---
+            const start60 = performance.now();
+            for (let i = 0; i < 60; i++) {
+                stepSimulation();
+            }
+            forceGpuSync();
+            const end60 = performance.now();
+            const time60 = end60 - start60;
+
+ // --- PHASE 3: Differential Math ---
+            // 1. Subtracting 10-step run removes the sync barrier cost (fixed overhead)
+            const pureGpuTime50 = time60 - time10;
+            
+            // 2. Calculate pure time per step (includes per-step JS dispatch overhead)
+            const timePerStep = pureGpuTime50 / 50;
+            
+            // 3. Derive fixed overhead (Total time for 10 - (Time per step * 10))
+            const pureGpuTime10 = timePerStep * 10;
+            const overhead = time10 - pureGpuTime10;
+            
+            // 4. Calculate final throughput
+            const stepsPerSecond = 50 / (pureGpuTime50 / 1000);
+
+            statsDiv.innerText = `--- WebGL2 Benchmark Complete ---\n` + 
+                                 `Particles: ${PARTICLE_COUNT}\n\n` +
+                                 `[Raw Measurements]\n` +
+                                 `Time for 10 steps (T10): ${time10.toFixed(2)} ms\n` +
+                                 `Time for 60 steps (T60): ${time60.toFixed(2)} ms\n\n` +
+                                 `[Differential Math]\n` +
+                                 `Compute Time (50 steps) = T60 - T10\n` +
+                                 `                        = ${time60.toFixed(2)} - ${time10.toFixed(2)}\n` +
+                                 `                        = ${pureGpuTime50.toFixed(2)} ms\n\n` +
+                                 `[Derived Metrics]\n` +
+                                 `Time per step (Compute + JS): ${timePerStep.toFixed(2)} ms\n` +
+                                 `Fixed Sync/Driver Overhead:   ${overhead.toFixed(2)} ms\n` +
+                                 `Throughput:                   ${stepsPerSecond.toFixed(2)} SPS`;
+        }, 50);
+    }, 50);
+}
+
+// We moved the execution trigger to the end of our new build function
+    if (isRenderMode) {
+        isRendering = true;
+        statsDiv.innerText = "Running Render Mode...\nWatch the cache burn.";
+        renderLoop();
+    } else {
+        runBenchmark();
+    }
+    console.log(`Initialized WebGL2 Pipeline. Particles: ${PARTICLE_COUNT}`);
+} // <--- CRITICAL: This bracket closes the buildPipelineAndStart() function!
+
+// --- 4.5. Dynamic UI Event Listeners (No Reloading!) ---
+document.getElementById('btn-low').addEventListener('click', () => {
+ if (isPipelineBuilt) return alert("Simulation already running! Please refresh the page to change modes.");
+ simMode = 'low';
+ statsDiv.innerText = "Mode: Low (16k, 32^3) Selected.\nAwaiting start...";
+});
+
+document.getElementById('btn-high').addEventListener('click', () => {
+ if (isPipelineBuilt) return alert("Simulation already running! Please refresh the page to change modes.");
+ simMode = 'high';
+ statsDiv.innerText = "Mode: High (65k, 32^3) Selected.\nAwaiting start...";
+});
+
+document.getElementById('btn-low-small').addEventListener('click', () => {
+ if (isPipelineBuilt) return alert("Simulation already running! Please refresh the page to change modes.");
+ simMode = 'low_small';
+ statsDiv.innerText = "Mode: Low Reduced Size (16k, 16^3) Selected.\nAwaiting start...";
+});
+
+document.getElementById('btn-render').addEventListener('click', () => {
+    buildPipelineAndStart(true);
+});
+
+document.getElementById('btn-headless').addEventListener('click', () => {
+    buildPipelineAndStart(false);
+});
+
+// Initial UI state
+statsDiv.innerText = "Mode: Low (16k) Default.\nSelect Mode, then press Start.";
+console.log("WebGL2 Pipeline ready to build. Waiting for user to press Start...");
+    </script>
+</body>
+</html>
